@@ -34,6 +34,18 @@ class HandEffectState:
     last_update: float = 0.0
     last_seen: float = 0.0
     entered_at: float = 0.0
+    palm_angle: float = 0.0
+    palm_axes: np.ndarray | None = None
+
+    def update_geometry(self, angle: float, axes: tuple[float, float]) -> None:
+        if self.palm_axes is None:
+            self.palm_angle = angle
+            self.palm_axes = np.asarray(axes, dtype=np.float32)
+            return
+        # Interpolate the shortest angular path to avoid 180-degree flips.
+        delta = (angle - self.palm_angle + 180.0) % 360.0 - 180.0
+        self.palm_angle += delta * 0.22
+        self.palm_axes += (np.asarray(axes, dtype=np.float32) - self.palm_axes) * 0.20
 
     def update(self, gesture: Gesture, palm: tuple[int, int], now: float, visible: bool = True) -> None:
         if self.last_update == 0.0:

@@ -40,19 +40,18 @@ class EffectsRenderer:
             self.particles.append(Particle(np.array(point, dtype=np.float32), velocity, now, self._rng.uniform(0.45, 0.9), color))
 
     def draw_trail(self, frame: np.ndarray, now: float) -> None:
-        self.trail = [item for item in self.trail if now - item[1] < 0.42]
+        self.trail = [item for item in self.trail if now - item[1] < 0.24][-10:]
         for index, (point, born, color) in enumerate(self.trail):
-            alpha = max(0.0, 1.0 - (now - born) / 0.42)
-            radius = max(1, int(2 + 4 * alpha * (index + 1) / max(len(self.trail), 1)))
+            alpha = max(0.0, 1.0 - (now - born) / 0.24)
+            radius = max(1, int(1 + 2 * alpha * (index + 1) / max(len(self.trail), 1)))
             dim = tuple(int(channel * alpha) for channel in color)
             cv2.circle(frame, point, radius, dim, -1, cv2.LINE_AA)
 
     def draw_cursor(self, frame: np.ndarray, point: tuple[int, int], color: tuple[int, int, int], drawing: bool, now: float) -> None:
-        pulse = 2.0 * math.sin(now * 8.0)
-        radius = int((18 if drawing else 13) + pulse)
-        cv2.circle(frame, point, radius + 5, tuple(int(c * 0.24) for c in color), 3, cv2.LINE_AA)
-        cv2.circle(frame, point, radius, color, 2, cv2.LINE_AA)
-        cv2.circle(frame, point, 3, (255, 255, 255), -1, cv2.LINE_AA)
+        pulse = 1 if math.sin(now * 7.0) > 0.35 else 0
+        radius = 8 + pulse if drawing else 7
+        cv2.circle(frame, point, radius, color, 1, cv2.LINE_AA)
+        cv2.circle(frame, point, 2, (220, 245, 255), -1, cv2.LINE_AA)
 
     def draw_particles(self, frame: np.ndarray, now: float) -> None:
         alive: list[Particle] = []

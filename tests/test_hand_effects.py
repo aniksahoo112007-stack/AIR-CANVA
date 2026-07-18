@@ -37,7 +37,20 @@ class HandEffectsTests(unittest.TestCase):
         self.assertIsNot(renderer.energy[1], renderer.energy[2])
         self.assertEqual(renderer.states[1].current_gesture, Gesture.OPEN_PALM)
         self.assertEqual(renderer.states[2].current_gesture, Gesture.PINCH)
-        self.assertGreater(len(renderer.energy[2].particles), 0)
+        self.assertEqual(len(renderer.energy[2].particles), 0)
+
+    def test_orientation_is_smoothed_and_effect_state_resets_after_gap(self) -> None:
+        renderer = HandEffectsRenderer()
+        hand = effect_hand(1, 320, Gesture.DRAW, True)
+        renderer.update([hand], 1.0, 30.0); renderer.update([hand], 1.1, 30.0)
+        frame = np.zeros((500, 800, 3), dtype=np.uint8); renderer.render(frame, [hand], 1.1)
+        initial = renderer.states[1].palm_angle
+        hand.pixels[[5, 17]] = hand.pixels[[17, 5]]
+        renderer.update([hand], 1.2, 30.0); renderer.render(frame, [hand], 1.2)
+        self.assertLess(abs(renderer.states[1].palm_angle-initial), 90.0)
+        stale_particle = object(); renderer.energy[1].particles.append(stale_particle)
+        renderer.update([hand], 2.0, 30.0)
+        self.assertNotIn(stale_particle, renderer.energy[1].particles)
 
 
 if __name__ == "__main__":

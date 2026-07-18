@@ -57,14 +57,12 @@ class EnergyTrailSystem:
         active = "index" if gesture in {Gesture.DRAW, Gesture.SELECT, Gesture.PINCH} else "palm"
         speed = velocities.get(active, 0.0)
         density = min(7, max(1, int((1 + speed / 180.0) * intensity * confidence)))
-        if gesture is Gesture.FIST:
+        if gesture in {Gesture.FIST, Gesture.PINCH}:
             density = 0
         self._spawn(anchors[active], now, density, particle_limit, converge=None)
         if gesture is Gesture.DRAW and speed > 80:
             self._spawn(anchors["index"], now, 2, particle_limit, converge=None, sparks=True)
         if gesture is Gesture.PINCH and not self._pinch_latched:
-            midpoint = tuple(np.mean((anchors["index"], anchors["thumb"]), axis=0).astype(int))
-            self._spawn(midpoint, now, 18, particle_limit, converge=np.asarray(midpoint), sparks=True)
             self._pinch_latched = True
         elif gesture is not Gesture.PINCH:
             self._pinch_latched = False
@@ -78,6 +76,9 @@ class EnergyTrailSystem:
             particle.velocity *= 0.985
             alive.append(particle)
         self.particles = alive[-particle_limit:]
+
+    def reset(self) -> None:
+        self.particles.clear();self.trails.clear();self.previous.clear();self._pinch_latched=False
 
     def _spawn(self, point: tuple[int, int], now: float, count: int, limit: int, converge: np.ndarray | None, sparks: bool = False) -> None:
         room = max(0, min(limit, MAX_FIRE_PARTICLES) - len(self.particles))
@@ -107,7 +108,7 @@ class EnergyTrailSystem:
         for name, trail in self.trails.items():
             points = [item for item in trail if now - item.timestamp < 0.55]
             self.trails[name] = deque(points, maxlen=MAX_ENERGY_TRAIL_POINTS)
-            if len(points) < 2 or not show_trails:
+            if len(points) < 2 or not show_trails or name != "index":
                 continue
             for index in range(1, len(points)):
                 age = now - points[index].timestamp

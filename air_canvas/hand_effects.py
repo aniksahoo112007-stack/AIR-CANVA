@@ -9,8 +9,11 @@ import cv2
 import numpy as np
 
 from .config import (
-    ENABLE_FIRE_TRAIL, ENABLE_HAND_CONNECTION_ARC, ENABLE_WRIST_TRAIL, HAND_EFFECT_QUALITY,
-    MAX_FIRE_PARTICLES, PRIMARY_EFFECT_COLOR, SECONDARY_EFFECT_COLOR, SHOW_BASE_SKELETON,
+    ACTIVE_FINGERTIP_MARKER_RADIUS, ENABLE_FIRE_TRAIL, ENABLE_HAND_CONNECTION_ARC,
+    FX_DEGRADE_BELOW_FPS, FX_RECOVER_ABOVE_FPS, FX_RECOVERY_HOLD_SECONDS, GLOW_ALPHA,
+    GLOW_BLUR_KERNEL, HAND_EFFECT_QUALITY, MAX_FIRE_PARTICLES, PASSIVE_FINGERTIP_MARKER_RADIUS,
+    PRIMARY_EFFECT_COLOR, SECONDARY_EFFECT_COLOR, SHOW_ACTIVE_FINGERTIP_MARKER,
+    SHOW_ALL_FINGERTIP_MARKERS, SHOW_BASE_SKELETON, SHOW_GESTURE_LABEL, SHOW_HAND_ROLE_LABEL,
     SHOW_TECHNICAL_LANDMARKS,
 )
 from .dual_hand_tracker import RoleTrackedHand
@@ -41,17 +44,21 @@ class HandEffectsRenderer:
         self.trails_enabled = True
         self._low_fps_since: float | None = None
         self._lost_spawned: set[int] = set()
+        self._degraded = False
+        self._recovery_since: float | None = None
 
     def update(self, hands: list[RoleTrackedHand], now: float, fps: float = 30.0) -> None:
         visible_ids = {hand.tracking_id for hand in hands}
         for hand in hands:
             state = self.states.setdefault(hand.tracking_id, HandEffectState(hand.tracking_id))
             center, _ = palm_geometry(hand.pixels)
+            stale = state.last_update > 0 and now-state.last_update > .45
             state.update(hand.gesture, center, now, True)
             system = self.energy.setdefault(hand.tracking_id, EnergyTrailSystem(hand.tracking_id))
+            if stale:system.reset()
             anchors = {"index": hand.index_tip, "thumb": hand.thumb_tip, "wrist": tuple(hand.pixels[0]), "palm": center}
             limit = self._particle_limit()
-            if ENABLE_FIRE_TRAIL and self.particles_enabled:
+            if ENABLE_FIRE_TRAIL and self.particles_enabled and not self._degraded:
                 system.update(anchors, hand.gesture, hand.confidence, now, state.particle_intensity, limit)
                 if hand.gesture is Gesture.OPEN_PALM and state.clear_progress >= 1.0 and not state.clear_burst_emitted:
                     system.burst(center, now, 32)
@@ -60,9 +67,6 @@ class HandEffectsRenderer:
             self._lost_spawned.discard(hand.tracking_id)
         for tracking_id, state in list(self.states.items()):
             if tracking_id not in visible_ids:
-                if tracking_id not in self._lost_spawned and state.last_position is not None and tracking_id in self.energy:
-                    self.energy[tracking_id].burst(tuple(state.last_position.astype(int)), now, 24)
-                    self._lost_spawned.add(tracking_id)
                 state.update(state.current_gesture, tuple(state.last_position.astype(int)) if state.last_position is not None else (0, 0), now, False)
                 if now - state.last_seen > 0.65:
                     self.states.pop(tracking_id, None)
@@ -94,11 +98,12 @@ class HandEffectsRenderer:
         sharp = np.zeros((y2 - y1, x2 - x1, 3), dtype=np.uint8)
         glow = np.zeros_like(sharp)
         color = PRIMARY_EFFECT_COLOR if hand.is_primary else SECONDARY_EFFECT_COLOR
-        center, base_radius = render_palm_hologram(sharp, glow, local_pixels, state, color, now, self.quality)
+        center, base_radius = render_palm_hologram(sharp, glow, local_pixels, state, color, now, self.quality, hand.is_primary)
         system = self.energy.get(hand.tracking_id)
         if system is not None and (self.particles_enabled or self.trails_enabled):
-            system.render(sharp, glow, now, color, state.trail_intensity, offset=(x1, y1), show_trails=self.trails_enabled, show_particles=self.particles_enabled)
-        self._draw_technical_hand(sharp, local_pixels, state, color, now)
+            show_particles=self.particles_enabled and not self._degraded and self.quality in {"high","ultra"}
+            system.render(sharp, glow, now, color, state.trail_intensity, offset=(x1, y1), show_trails=self.trails_enabled and hand.gesture is Gesture.DRAW, show_particles=show_particles)
+        self._draw_technical_hand(sharp, local_pixels, state, color, now, hand.gesture, hand.is_primary)
         if hand.gesture is Gesture.SELECT:
             for index in (8, 12):
                 point = tuple(local_pixels[index])
@@ -111,33 +116,37 @@ class HandEffectsRenderer:
             radius = int(8 + (1.0 - state.pinch_flash_timer) * 35)
             cv2.circle(sharp, midpoint, radius, (220, 245, 255), 2, cv2.LINE_AA)
             cv2.circle(glow, midpoint, max(8, int(24 * state.pinch_flash_timer)), color, -1, cv2.LINE_AA)
-        if self.quality != "low" and self.performance_scale >= 0.5:
-            glow = cv2.GaussianBlur(glow, (0, 0), 4.0 if self.quality == "high" else 2.5)
+        if self.quality != "low" and not self._degraded:
+            glow = cv2.GaussianBlur(glow, (GLOW_BLUR_KERNEL, GLOW_BLUR_KERNEL), 0)
         roi = frame[y1:y2, x1:x2]
-        cv2.addWeighted(roi, 1.0, glow, 0.82 * state.fade, 0, roi)
+        cv2.addWeighted(roi, 1.0, glow, GLOW_ALPHA * state.fade, 0, roi)
         mask = np.any(sharp > 0, axis=2)
-        mixed = cv2.addWeighted(roi, 0.18, sharp, 0.95 * state.fade, 0)
+        mixed = cv2.addWeighted(roi, 0.35, sharp, 0.90 * state.fade, 0)
         roi[mask] = mixed[mask]
         role = "PRIMARY" if hand.is_primary else "SECONDARY"
-        label_point = (max(3, center[0] - base_radius), min(sharp.shape[0] - 6, center[1] + base_radius + 15))
-        cv2.putText(roi, f"{role}  {hand.gesture.value.upper()}", label_point, cv2.FONT_HERSHEY_DUPLEX, 0.3, color, 1, cv2.LINE_AA)
+        parts=[]
+        if SHOW_HAND_ROLE_LABEL:parts.append(role)
+        if SHOW_GESTURE_LABEL:parts.append(hand.gesture.value.upper())
+        if parts:
+            label="  ".join(parts);label_point=(max(3,center[0]-base_radius),min(sharp.shape[0]-8,center[1]+base_radius+18))
+            text_size=cv2.getTextSize(label,cv2.FONT_HERSHEY_DUPLEX,.3,1)[0]
+            chip=roi.copy();cv2.rectangle(chip,(label_point[0]-3,label_point[1]-11),(label_point[0]+text_size[0]+4,label_point[1]+4),(15,18,22),-1)
+            cv2.addWeighted(chip,.55,roi,.45,0,roi);cv2.putText(roi,label,label_point,cv2.FONT_HERSHEY_DUPLEX,.3,color,1,cv2.LINE_AA)
 
     @staticmethod
-    def _draw_technical_hand(layer: np.ndarray, pixels: np.ndarray, state: HandEffectState, color: tuple[int, int, int], now: float) -> None:
+    def _draw_technical_hand(layer: np.ndarray, pixels: np.ndarray, state: HandEffectState, color: tuple[int, int,int], now: float, gesture: Gesture, primary: bool) -> None:
         faded_white = tuple(int(205 * state.fade) for _ in range(3))
         if SHOW_BASE_SKELETON:
             for start, end in CONNECTIONS:
                 cv2.line(layer, tuple(pixels[start]), tuple(pixels[end]), tuple(int(c * 0.32 * state.fade) for c in color), 1, cv2.LINE_AA)
-        if not SHOW_TECHNICAL_LANDMARKS:
-            return
-        for start, end in ((0, 5), (5, 9), (9, 13), (13, 17), (17, 0)):
-            cv2.line(layer, tuple(pixels[start]), tuple(pixels[end]), tuple(int(c * 0.5) for c in faded_white), 1, cv2.LINE_AA)
-        for index in HUD_LANDMARKS:
-            point = tuple(pixels[index])
-            radius = 4 if index in (4, 8, 12, 16, 20) else 3
-            cv2.circle(layer, point, radius, faded_white, 1, cv2.LINE_AA)
-            angle = int((now * (90 + index * 3)) % 360)
-            cv2.ellipse(layer, point, (radius + 3, radius + 3), 0, angle, angle + 75, color, 1, cv2.LINE_AA)
+        # The primary fingertip is rendered once by EffectsRenderer; only the
+        # secondary hand needs a marker here.
+        if SHOW_ACTIVE_FINGERTIP_MARKER and not primary:
+            radius=ACTIVE_FINGERTIP_MARKER_RADIUS+(1 if math.sin(now*7)>0 else 0)
+            cv2.circle(layer,tuple(pixels[8]),radius,color,1,cv2.LINE_AA)
+        if gesture is Gesture.PINCH:cv2.circle(layer,tuple(pixels[4]),max(3,ACTIVE_FINGERTIP_MARKER_RADIUS-3),faded_white,1,cv2.LINE_AA)
+        if SHOW_ALL_FINGERTIP_MARKERS:
+            for index in (4,12,16,20):cv2.circle(layer,tuple(pixels[index]),PASSIVE_FINGERTIP_MARKER_RADIUS,tuple(int(c*.45) for c in faded_white),-1,cv2.LINE_AA)
 
     def _render_connection_arc(self, frame: np.ndarray, hands: list[RoleTrackedHand], now: float) -> None:
         if not ENABLE_HAND_CONNECTION_ARC or len(hands) != 2 or self.quality == "low":
@@ -162,14 +171,14 @@ class HandEffectsRenderer:
 
     def adapt_to_fps(self, fps: float, now: float | None = None) -> None:
         now = time.monotonic() if now is None else now
-        self.performance_scale = 1.0 if fps > 28 else 0.62 if fps >= 21 else 0.35
-        if fps < 21:
+        self.performance_scale = 1.0 if fps >= FX_RECOVER_ABOVE_FPS else 0.62 if fps >= FX_DEGRADE_BELOW_FPS else 0.35
+        if fps < FX_DEGRADE_BELOW_FPS:
             self._low_fps_since = self._low_fps_since or now
-            if now - self._low_fps_since > 3.0:
-                self.quality = "medium" if self.quality in {"high", "ultra"} else "low"
-                self._low_fps_since = now
-        else:
+            self._degraded=True;self._recovery_since=None
+        elif fps >= FX_RECOVER_ABOVE_FPS:
             self._low_fps_since = None
+            self._recovery_since=self._recovery_since or now
+            if now-self._recovery_since>=FX_RECOVERY_HOLD_SECONDS:self._degraded=False
 
     def cycle_quality(self) -> str:
         levels = ("low", "medium", "high", "ultra")
