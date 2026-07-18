@@ -40,7 +40,7 @@ class UIRenderer:
         self._static, self._static_mask = layer, mask
         self._visible = mask > 0
 
-    def draw(self, frame: np.ndarray, *, layout: UILayout, fps: float, tracking: bool, hand_count: int = 0, tool: str, brush_size: int, mode: str, glow: bool, skeleton: bool, view: str, history_position: int, history_total: int, quality: str = "high") -> None:
+    def draw(self, frame: np.ndarray, *, layout: UILayout, fps: float, tracking: bool, hand_count: int = 0, tool: str, brush_size: int, mode: str, glow: bool, skeleton: bool, view: str, history_position: int, history_total: int, quality: str = "high", assist: str = "off", auto_shape: bool = False, cleanup: str = "balanced") -> None:
         height, width = frame.shape[:2]
         self._ensure_cache(layout)
         assert self._static is not None and self._visible is not None
@@ -61,6 +61,8 @@ class UIRenderer:
         shortcuts = "S SAVE  Z/Y HISTORY  P QUALITY  T TRAILS  K PARTICLES  H HAND  X SWAP  W BOARD  Q QUIT"
         shortcut_size = cv2.getTextSize(shortcuts, cv2.FONT_HERSHEY_SIMPLEX, sf(0.29), 1)[0]
         cv2.putText(frame, shortcuts, (max(s(18), width - shortcut_size[0] - s(18)), height - s(31)), cv2.FONT_HERSHEY_SIMPLEX, sf(0.29), (95, 140, 180), 1, cv2.LINE_AA)
+        assistance = f"ASSIST {assist.upper()}  |  AUTO SHAPE {'ON' if auto_shape else 'OFF'}  |  CLEANUP {cleanup.upper()}"
+        cv2.putText(frame, assistance, (s(18), height - s(31)), cv2.FONT_HERSHEY_SIMPLEX, sf(0.29), (90, 205, 210), 1, cv2.LINE_AA)
         toggles = f"GLOW {'ON' if glow else 'OFF'} / HAND {'ON' if skeleton else 'OFF'}"
         cv2.putText(frame, toggles, (width - s(260), bottom), cv2.FONT_HERSHEY_SIMPLEX, sf(0.29), (80, 220, 190), 1, cv2.LINE_AA)
 

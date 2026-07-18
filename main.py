@@ -20,6 +20,8 @@ from air_canvas.animation_manager import AnimationManager
 from air_canvas.camera_manager import CameraManager
 from air_canvas.camera_selector import CameraSelector
 from air_canvas.camera_view_controls import CameraViewControls
+from air_canvas.drawing_assistant import DrawingAssistant
+from air_canvas.drawing_assist_ui import DrawingAssistUI
 from air_canvas.config import (
     APP_NAME, BRUSH_STEP, CAMERA_DISPLAY_MODE, CAMERA_READ_FAILURE_LIMIT, COLORS, DEBUG_CAMERA_UI, DEBUG_TOOLBAR_INTERACTION, DEFAULT_BRUSH_SIZE,
     DEBUG_DRAWING_PIPELINE, DEBUG_DRAWING_SMOOTHING, DEBUG_DUAL_HAND_TRACKING, DEBUG_GESTURES,
@@ -38,11 +40,18 @@ from air_canvas.effects import EffectsRenderer
 from air_canvas.gesture_detector import Gesture, GestureDetector
 from air_canvas.hand_tracker import HandTracker, HandTrackerError
 from air_canvas.history_manager import HistoryManager
+from air_canvas.history_manager import CanvasSnapshot
 from air_canvas.hand_effects import HandEffectsRenderer
 from air_canvas.toolbar import Toolbar
 from air_canvas.ui_renderer import UIRenderer
 from air_canvas.ui_layout import CameraViewState, UILayout
+from air_canvas.shape_recognizer import ShapeRecognitionResult, ShapeRecognizer, render_corrected_shape
+from air_canvas.sketch_cleaner import CleanupResult, SketchCleaner
 from air_canvas.config import UI_REFERENCE_WIDTH, UI_REFERENCE_HEIGHT
+from air_canvas.config import (
+    AUTO_SHAPE_DEFAULT, CLEANUP_DEFAULT, DEBUG_DRAW_ASSIST, DEBUG_SHAPE_RECOGNITION,
+    DRAW_ASSIST_DEFAULT, SHAPE_CONFIDENCE_THRESHOLD, SHAPE_PREVIEW_TIMEOUT_SECONDS,
+)
 
 
 class AirCanvasApp:
@@ -52,6 +61,7 @@ class AirCanvasApp:
         self.camera_manager = CameraManager()
         self.camera_selector = CameraSelector()
         self.camera_view_controls = CameraViewControls()
+        self.drawing_assist_ui = DrawingAssistUI()
         self.camera_override = camera_override
         self.tracker: HandTracker | None = None
         self.dual_tracker: DualHandTracker | None = None
@@ -63,6 +73,18 @@ class AirCanvasApp:
         self.effects = EffectsRenderer()
         self.hand_effects = HandEffectsRenderer()
         self.ui = UIRenderer()
+        self.drawing_assistant = DrawingAssistant(DRAW_ASSIST_DEFAULT)
+        self.shape_recognizer = ShapeRecognizer()
+        self.sketch_cleaner = SketchCleaner()
+        self.auto_shape = AUTO_SHAPE_DEFAULT
+        self.cleanup_intensity = CLEANUP_DEFAULT
+        self.pending_shape: dict[str, object] | None = None
+        self.pending_cleanup: dict[str, object] | None = None
+        self._stroke_before: CanvasSnapshot | None = None
+        self._stroke_color: tuple[int, int, int] = (0, 0, 255)
+        self._stroke_size = DEFAULT_BRUSH_SIZE
+        self._shape_hold_anchor: tuple[int, int] | None = None
+        self._shape_hold_started: float | None = None
         self.active_tool_id = "red"
         self.brush_size = DEFAULT_BRUSH_SIZE
         self.enable_glow = enable_glow
@@ -228,6 +250,7 @@ class AirCanvasApp:
                     gesture, ui_tip, hover_tool, hand.pinch_active,
                     hand.pinch_distance, now, (width, height), hand.tracking_id, hand.confidence, canvas_point,
                 )
+                self._update_shape_hold(canvas_point, now)
             else:
                 self._end_stroke("hand lost")
                 self._reset_draw_confirmation()
@@ -258,6 +281,17 @@ class AirCanvasApp:
             if self.enable_particles:
                 self.effects.draw_particles(composed, now)
             composed = self._apply_view_transition(composed, now)
+            if self.pending_shape is not None:
+                result = self.pending_shape["result"]
+                assert isinstance(result, ShapeRecognitionResult)
+                render_corrected_shape(composed, np.zeros(composed.shape[:2], np.uint8), result, (80, 235, 255), max(2, self._stroke_size))
+            if self.pending_cleanup is not None:
+                cleanup = self.pending_cleanup["result"]
+                assert isinstance(cleanup, CleanupResult)
+                cleaned = base.copy(); visible = cleanup.mask > 0; cleaned[visible] = cleanup.image[visible]
+                midpoint = composed.shape[1] // 2
+                composed[:, midpoint:] = cleaned[:, midpoint:]
+                cv2.line(composed, (midpoint, 0), (midpoint, composed.shape[0]), (80, 220, 255), 2, cv2.LINE_AA)
             self.last_content_frame = composed.copy()
             presented = self.layout.present(composed)
 
@@ -273,16 +307,24 @@ class AirCanvasApp:
                 history_position=self.history.current_position,
                 history_total=self.history.total_states,
                 quality=self.hand_effects.quality,
+                assist=self.drawing_assistant.level, auto_shape=self.auto_shape, cleanup=self.cleanup_intensity,
             )
             self.toolbar.draw(
                 presented, self.active_tool_id, self.hovered_action_id, self.toolbar_dwell_progress, now,
                 can_undo=self.history.can_undo(), can_redo=self.history.can_redo(),
                 whiteboard=self.whiteboard_mode,
             )
+            self.drawing_assist_ui.render_controls(presented, self.layout, self.drawing_assistant.level, self.auto_shape, self.cleanup_intensity)
             self.ui.draw_help_panel(presented, self.layout)
             live_status = self.camera_manager.last_read_success and now - self.camera_manager.last_successful_frame_time < 1.0
             self.camera_selector.render(presented, live_status, self.layout)
             self.camera_view_controls.render(presented, self.layout, view_state.current_zoom)
+            if self.pending_shape is not None:
+                result = self.pending_shape["result"]
+                assert isinstance(result, ShapeRecognitionResult)
+                self.drawing_assist_ui.render_confirmation(presented, self.layout, f"{result.shape_type.upper()} DETECTED - HOLD TO ACCEPT")
+            elif self.pending_cleanup is not None:
+                self.drawing_assist_ui.render_confirmation(presented, self.layout, "SKETCH CLEANUP PREVIEW", "ENTER TO APPLY / ESC TO CANCEL")
             if DEBUG_CAMERA_UI:
                 self._draw_camera_debug(presented)
             self.animations.draw(presented, now)
@@ -293,8 +335,9 @@ class AirCanvasApp:
                     pinch_active=self.debug_pinch_active, hovered=self.debug_hovered,
                     toolbar_y=self.toolbar.y_range,
                 )
-            if DEBUG_DUAL_HAND_TRACKING or DEBUG_DRAWING_SMOOTHING or DEBUG_GESTURES or DEBUG_DRAWING_PIPELINE:
+            if DEBUG_DUAL_HAND_TRACKING or DEBUG_DRAWING_SMOOTHING or DEBUG_GESTURES or DEBUG_DRAWING_PIPELINE or DEBUG_DRAW_ASSIST or DEBUG_SHAPE_RECOGNITION:
                 self._draw_runtime_debug(presented)
+            self._expire_pending_preview(now)
             cv2.imshow(WINDOW_NAME, presented)
             key = cv2.waitKeyEx(1)
             control, shift = self._keyboard_modifiers()
@@ -323,6 +366,9 @@ class AirCanvasApp:
         selection_mode = gesture in {Gesture.SELECT, Gesture.PINCH}
         new_pinch = pinch_now and not self.pinch_previous
         self.pinch_previous = pinch_now
+        if new_pinch and (self.pending_shape is not None or self.pending_cleanup is not None):
+            self._accept_pending_preview(now)
+            return
         if new_pinch:
             self.animations.ripple(point, now, self.active_color)
         if selection_mode:
@@ -341,12 +387,19 @@ class AirCanvasApp:
             if not self._drawing_gesture_confirmed and self._draw_confirm_frames >= DRAW_START_CONFIRM_FRAMES:
                 self._drawing_gesture_confirmed = True
             if self._drawing_gesture_confirmed and not self.stroke_in_progress:
+                self._reject_pending_preview()
                 self.history.begin_stroke(self.canvas.image, self.canvas.mask)
+                self._stroke_before = self.history.snapshot(self.canvas.image, self.canvas.mask)
+                self._stroke_color = self.active_color
+                self._stroke_size = self.brush_size
+                self.drawing_assistant.reset()
+                assisted_point = self.drawing_assistant.add_point(drawing_point, now)
                 self.stroke_in_progress = True
-                if self.canvas.start_stroke(drawing_point, hand_id, now) and DEBUG_DRAWING_PIPELINE:
+                if self.canvas.start_stroke(assisted_point, hand_id, now) and DEBUG_DRAWING_PIPELINE:
                     print(f"[DRAW] Stroke started: hand={hand_id}")
             elif self._drawing_gesture_confirmed:
-                accepted = self.canvas.append_stroke_point(drawing_point, hand_id, now, self.active_color, self.brush_size, self.active_tool_id == "eraser")
+                assisted_point = self.drawing_assistant.add_point(drawing_point, now)
+                accepted = self.canvas.append_stroke_point(assisted_point, hand_id, now, self.active_color, self.brush_size, self.active_tool_id == "eraser")
                 if not accepted and self.canvas.last_rejection_reason not in {"below minimum distance", "smoothed movement below minimum", ""}:
                     if self.canvas.last_rejection_reason != self._last_drawing_rejection and DEBUG_DRAWING_PIPELINE:
                         print(f"[DRAW] Point rejected: {self.canvas.last_rejection_reason}")
@@ -399,6 +452,7 @@ class AirCanvasApp:
     def _end_stroke(self, reason: str = "ended") -> None:
         assert self.canvas is not None
         was_in_progress = self.stroke_in_progress
+        assisted_points = self.drawing_assistant.finish_stroke() if was_in_progress else []
         if self.stroke_in_progress:
             self.history.commit_stroke(self.canvas.image, self.canvas.mask)
         self.canvas.end_stroke(reason)
@@ -406,6 +460,19 @@ class AirCanvasApp:
         self._draw_confirm_frames = 0
         self._draw_absent_frames = 0
         self._drawing_gesture_confirmed = False
+        if (was_in_progress and self.auto_shape and self.active_tool_id != "eraser" and
+                self._stroke_before is not None and len(assisted_points) >= 6):
+            result = self.shape_recognizer.recognize(assisted_points)
+            if DEBUG_SHAPE_RECOGNITION:
+                print(f"[SHAPE] {result.shape_type} confidence={result.confidence:.3f} bounds={result.bounding_box}")
+            if result.shape_type != "freehand" and result.confidence >= SHAPE_CONFIDENCE_THRESHOLD:
+                self.pending_shape = {
+                    "result": result, "before": self._stroke_before,
+                    "color": self._stroke_color, "size": self._stroke_size,
+                    "expires": time.monotonic() + SHAPE_PREVIEW_TIMEOUT_SECONDS,
+                }
+                self.animations.notify(f"{result.shape_type.upper()} DETECTED", time.monotonic(), 1.0)
+        self._stroke_before = None
         if was_in_progress and DEBUG_DRAWING_PIPELINE:
             print(f"[DRAW] Stroke ended: {reason}")
 
@@ -587,6 +654,13 @@ class AirCanvasApp:
 
     def _handle_key(self, key: int, now: float, size: tuple[int, int], control: bool = False, shift: bool = False) -> bool:
         assert self.canvas is not None
+        if key in (10, 13) and (self.pending_shape is not None or self.pending_cleanup is not None):
+            self._accept_pending_preview(now)
+            return True
+        if key == 27 and (self.pending_shape is not None or self.pending_cleanup is not None):
+            self._reject_pending_preview()
+            self.animations.notify("PREVIEW CANCELLED", now, 0.9)
+            return True
         if key in (ord("q"), ord("Q"), 27):
             return False
         if key in (ord("c"), ord("C")):
@@ -618,6 +692,12 @@ class AirCanvasApp:
         elif key in (ord("j"), ord("J")):
             self.ui.help_visible = not self.ui.help_visible
             self.animations.notify(f"GESTURE HELP {'ON' if self.ui.help_visible else 'OFF'}", now, 1.1)
+        elif key in (ord("a"), ord("A")):
+            self._cycle_drawing_assist(now)
+        elif key in (ord("n"), ord("N")):
+            self._toggle_auto_shape(now)
+        elif key in (ord("l"), ord("L")):
+            self._request_cleanup(now)
         elif key in (ord("+"), ord("=")):
             self._adjust_camera_zoom(1, now)
         elif key in (ord("-"), ord("_")):
@@ -699,6 +779,21 @@ class AirCanvasApp:
             self._use_camera(selected, now)
 
     def _on_mouse(self, event: int, x: int, y: int, flags: int, _userdata: object = None) -> None:
+        assist_action = self.drawing_assist_ui.update_mouse(event, x, y)
+        if assist_action is not None:
+            now = time.monotonic()
+            if assist_action == "assist":
+                self._cycle_drawing_assist(now)
+            elif assist_action == "shape":
+                self._toggle_auto_shape(now)
+            elif assist_action == "clean":
+                self._request_cleanup(now)
+            elif assist_action == "accept":
+                self._accept_pending_preview(now)
+            elif assist_action == "cancel":
+                self._reject_pending_preview()
+                self.animations.notify("PREVIEW CANCELLED", now, 0.9)
+            return
         action = self.camera_view_controls.update_mouse(event, x, y)
         if action is not None:
             now = time.monotonic()
@@ -747,6 +842,71 @@ class AirCanvasApp:
     def _reset_camera_view(self, now: float) -> None:
         self._active_view_state().reset_view()
         self.animations.notify("CAMERA VIEW RESET", now, 1.0)
+
+    def _cycle_drawing_assist(self, now: float) -> None:
+        self._end_stroke("assistance changed")
+        level = self.drawing_assistant.cycle_level()
+        self.animations.notify(f"ASSIST {level.upper()}", now, 1.0)
+
+    def _toggle_auto_shape(self, now: float) -> None:
+        self._end_stroke("auto shape changed")
+        self.auto_shape = not self.auto_shape
+        self._reject_pending_preview()
+        self.animations.notify(f"AUTO SHAPE {'ON' if self.auto_shape else 'OFF'}", now, 1.0)
+
+    def _request_cleanup(self, now: float) -> None:
+        assert self.canvas is not None
+        self._end_stroke("cleanup requested")
+        self._reject_pending_preview()
+        if not np.any(self.canvas.mask):
+            self.animations.notify("NOTHING TO CLEAN", now, 1.0)
+            return
+        result = self.sketch_cleaner.clean(self.canvas.image, self.canvas.mask, self.cleanup_intensity)
+        source = self.history.snapshot(self.canvas.image, self.canvas.mask)
+        self.pending_cleanup = {"result": result, "source": source, "expires": now + SHAPE_PREVIEW_TIMEOUT_SECONDS}
+        self.animations.notify("CLEANUP PREVIEW", now, 1.0)
+
+    def _accept_pending_preview(self, now: float) -> None:
+        assert self.canvas is not None
+        if self.pending_shape is not None:
+            pending = self.pending_shape
+            result, before = pending["result"], pending["before"]
+            assert isinstance(result, ShapeRecognitionResult) and isinstance(before, CanvasSnapshot)
+            rough = self.history.snapshot(self.canvas.image, self.canvas.mask)
+            corrected_image, corrected_mask = before.image.copy(), before.mask.copy()
+            render_corrected_shape(corrected_image, corrected_mask, result, pending["color"], int(pending["size"]))  # type: ignore[arg-type]
+            self.history.begin_stroke(rough.image, rough.mask)
+            self.canvas.restore(CanvasSnapshot(corrected_image, corrected_mask))
+            self.history.commit_stroke(self.canvas.image, self.canvas.mask)
+            self.animations.notify(f"{result.shape_type.upper()} APPLIED", now, 1.1)
+        elif self.pending_cleanup is not None:
+            result = self.pending_cleanup["result"]
+            assert isinstance(result, CleanupResult)
+            self.history.begin_stroke(self.canvas.image, self.canvas.mask)
+            self.canvas.restore(CanvasSnapshot(result.image, result.mask))
+            self.history.commit_stroke(self.canvas.image, self.canvas.mask)
+            self.animations.notify("CLEANUP APPLIED", now, 1.1)
+        self._reject_pending_preview()
+
+    def _reject_pending_preview(self) -> None:
+        self.pending_shape = None
+        self.pending_cleanup = None
+        self._shape_hold_anchor = None
+        self._shape_hold_started = None
+
+    def _expire_pending_preview(self, now: float) -> None:
+        pending = self.pending_shape or self.pending_cleanup
+        if pending is not None and now >= float(pending["expires"]):
+            self._reject_pending_preview()
+
+    def _update_shape_hold(self, point: tuple[int, int], now: float) -> None:
+        if self.pending_shape is None:
+            self._shape_hold_anchor = None; self._shape_hold_started = None
+            return
+        if self._shape_hold_anchor is None or np.linalg.norm(np.subtract(point, self._shape_hold_anchor)) > 8.0:
+            self._shape_hold_anchor, self._shape_hold_started = point, now
+        elif self._shape_hold_started is not None and now - self._shape_hold_started >= 0.5:
+            self._accept_pending_preview(now)
 
     def _after_camera_change(self, now: float) -> None:
         self._end_stroke("camera changed")
@@ -895,6 +1055,21 @@ class AirCanvasApp:
                 cv2.circle(frame, raw, 3, (0, 0, 255), -1, cv2.LINE_AA)
             if smoothed is not None:
                 cv2.circle(frame, smoothed, 3, (0, 255, 0), -1, cv2.LINE_AA)
+        if DEBUG_DRAW_ASSIST and self.canvas is not None:
+            native_size = (self.canvas.image.shape[1], self.canvas.image.shape[0])
+            for point in self.drawing_assistant.raw_points:
+                cv2.circle(frame, self.layout.camera_to_window(point, native_size), 2, (70, 70, 255), -1, cv2.LINE_AA)
+            for point in self.drawing_assistant.stabilized_points:
+                cv2.circle(frame, self.layout.camera_to_window(point, native_size), 2, (70, 255, 120), -1, cv2.LINE_AA)
+            lines.append(f"ASSIST {self.drawing_assistant.level.upper()} RAW {len(self.drawing_assistant.raw_points)} STABLE {len(self.drawing_assistant.stabilized_points)}")
+        if DEBUG_SHAPE_RECOGNITION and self.pending_shape is not None and self.canvas is not None:
+            result = self.pending_shape["result"]
+            assert isinstance(result, ShapeRecognitionResult)
+            native_size = (self.canvas.image.shape[1], self.canvas.image.shape[0])
+            x, y, w, h = result.bounding_box
+            p1 = self.layout.camera_to_window((x, y), native_size); p2 = self.layout.camera_to_window((x+w, y+h), native_size)
+            cv2.rectangle(frame, p1, p2, (80, 220, 255), 1, cv2.LINE_AA)
+            lines.append(f"SHAPE {result.shape_type.upper()} CONF {result.confidence:.3f}")
         lines.append(f"DWELL {self.toolbar_dwell_progress:.0%}")
         y = 370
         for line in lines:

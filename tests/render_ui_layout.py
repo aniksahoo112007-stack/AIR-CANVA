@@ -8,6 +8,7 @@ import numpy as np
 from air_canvas.camera_manager import CameraInfo
 from air_canvas.camera_selector import CameraSelector
 from air_canvas.camera_view_controls import CameraViewControls
+from air_canvas.drawing_assist_ui import DrawingAssistUI
 from air_canvas.toolbar import Toolbar
 from air_canvas.ui_layout import UILayout
 from air_canvas.ui_renderer import UIRenderer
@@ -25,10 +26,12 @@ def render(width: int, height: int, filename: str, zoom: float = 1.0) -> None:
         frame, layout=layout, fps=30.0, tracking=True, hand_count=1, tool="Red",
         brush_size=7, mode="Draw", glow=True, skeleton=True, view="Camera",
         history_position=2, history_total=4,
+        assist="medium", auto_shape=True, cleanup="balanced",
     )
     toolbar = Toolbar(1600)
     toolbar.update_layout(layout)
     toolbar.draw(frame, "red", None, 0.0, 0.0, can_undo=True, can_redo=True, whiteboard=False)
+    DrawingAssistUI().render_controls(frame, layout, "medium", True, "balanced")
     ui.draw_help_panel(frame, layout)
     selector = CameraSelector()
     selector.set_cameras([CameraInfo(0, cv2.CAP_DSHOW, "DSHOW", width, height, 30.0)], 0)
