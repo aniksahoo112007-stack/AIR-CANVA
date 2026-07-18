@@ -50,7 +50,7 @@ from air_canvas.sketch_cleaner import CleanupResult, SketchCleaner
 from air_canvas.config import UI_REFERENCE_WIDTH, UI_REFERENCE_HEIGHT
 from air_canvas.config import (
     AUTO_SHAPE_DEFAULT, CLEANUP_DEFAULT, DEBUG_DRAW_ASSIST, DEBUG_SHAPE_RECOGNITION,
-    DRAW_ASSIST_DEFAULT, SHAPE_CONFIDENCE_THRESHOLD, SHAPE_PREVIEW_TIMEOUT_SECONDS,
+    DRAW_ASSIST_DEFAULT, SHAPE_CONFIDENCE_THRESHOLD, SHAPE_PREVIEW_TIMEOUT_SECONDS, ENABLE_DESKTOP_ANNOTATION,
 )
 
 
@@ -141,6 +141,9 @@ class AirCanvasApp:
         self._last_view_update = time.monotonic()
         self._panning_camera = False
         self._pan_previous: tuple[int, int] | None = None
+        self.desktop_annotation = None
+        self.desktop_hotkeys = None
+        self._desktop_window_hidden = False
 
     def run(self) -> int:
         """Run until exit and release all native resources on every path."""
@@ -151,6 +154,9 @@ class AirCanvasApp:
             print(f"{APP_NAME}: {exc}", file=sys.stderr)
             return 1
         finally:
+            self._close_desktop_annotation()
+            if self.desktop_hotkeys is not None:
+                self.desktop_hotkeys.close()
             self.camera_manager.release()
             if self.tracker is not None:
                 self.tracker.close()
@@ -174,6 +180,14 @@ class AirCanvasApp:
         cv2.resizeWindow(WINDOW_NAME, UI_REFERENCE_WIDTH, UI_REFERENCE_HEIGHT)
         cv2.setMouseCallback(WINDOW_NAME, self._on_mouse)
         self._apply_fullscreen()
+        if ENABLE_DESKTOP_ANNOTATION:
+            try:
+                from air_canvas.hotkey_manager import HotkeyManager
+                self.desktop_hotkeys = HotkeyManager()
+                if not self.desktop_hotkeys.register("desktop"):
+                    print("[DESKTOP] F8 is already registered by another application", file=sys.stderr)
+            except OSError as exc:
+                print(f"[DESKTOP] Global hotkeys unavailable: {exc}", file=sys.stderr)
 
     def _event_loop(self) -> int:
         assert self.tracker is not None and self.dual_tracker is not None
@@ -220,6 +234,25 @@ class AirCanvasApp:
 
             hands = self.dual_tracker.detect(camera_frame, now) if frame_live else []
             self.current_hands = hands
+            if self.desktop_hotkeys is not None:
+                for desktop_action in self.desktop_hotkeys.poll():
+                    self._handle_desktop_action(desktop_action, now)
+            if self.desktop_annotation is not None and self.desktop_annotation.active:
+                self.desktop_annotation.set_camera(-1 if self.camera_manager.active_info is None else self.camera_manager.active_info.index)
+                try:
+                    self.desktop_annotation.update(hands, camera_frame if frame_live else None, fps, now)
+                except Exception as exc:
+                    print(f"[DESKTOP] Overlay stopped: {exc}", file=sys.stderr)
+                    self._close_desktop_annotation()
+                    self.animations.notify("DESKTOP OVERLAY FAILED", now, 2.0, (50, 80, 255))
+                current = time.perf_counter()
+                instantaneous_fps = 1.0 / max(current - previous_frame_time, 1e-6)
+                fps = instantaneous_fps if fps == 0.0 else fps * 0.88 + instantaneous_fps * 0.12
+                previous_frame_time = current
+                if self.desktop_annotation is not None and not self.desktop_annotation.active:
+                    self._close_desktop_annotation()
+                cv2.waitKeyEx(1)
+                continue
             hand = next((item for item in hands if item.is_primary), None)
             gesture = Gesture.IDLE
             hover_tool: str | None = None
@@ -657,6 +690,9 @@ class AirCanvasApp:
         if key in (10, 13) and (self.pending_shape is not None or self.pending_cleanup is not None):
             self._accept_pending_preview(now)
             return True
+        if key == 0x770000 or key == 0x77:
+            self._toggle_desktop_annotation(now)
+            return True
         if key == 27 and (self.pending_shape is not None or self.pending_cleanup is not None):
             self._reject_pending_preview()
             self.animations.notify("PREVIEW CANCELLED", now, 0.9)
@@ -788,6 +824,8 @@ class AirCanvasApp:
                 self._toggle_auto_shape(now)
             elif assist_action == "clean":
                 self._request_cleanup(now)
+            elif assist_action == "desktop":
+                self._toggle_desktop_annotation(now)
             elif assist_action == "accept":
                 self._accept_pending_preview(now)
             elif assist_action == "cancel":
@@ -824,6 +862,64 @@ class AirCanvasApp:
             self._pan_previous = (x, y)
             return
         self.camera_selector.update_mouse(event, x, y, flags)
+
+    def _toggle_desktop_annotation(self, now: float) -> None:
+        if self.desktop_annotation is not None and self.desktop_annotation.active:
+            self._close_desktop_annotation()
+            self.animations.notify("DESKTOP ANNOTATION OFF", now, 1.2)
+            return
+        try:
+            from air_canvas.annotation_controller import AnnotationController
+            camera_index = -1 if self.camera_manager.active_info is None else self.camera_manager.active_info.index
+            self.desktop_annotation = AnnotationController(camera_index)
+            self.desktop_annotation.enter()
+            if self.desktop_hotkeys is not None:
+                failed = self.desktop_hotkeys.register_active()
+                if failed:
+                    print(f"[DESKTOP] Hotkeys unavailable: {', '.join(failed)}", file=sys.stderr)
+            cv2.moveWindow(WINDOW_NAME, self.desktop_annotation.monitor.right + 40, self.desktop_annotation.monitor.bottom + 40)
+            self._desktop_window_hidden = True
+        except Exception as exc:
+            self._close_desktop_annotation()
+            self.animations.notify("DESKTOP OVERLAY FAILED", now, 2.0, (50, 80, 255))
+            print(f"[DESKTOP] Initialization failed: {exc}", file=sys.stderr)
+
+    def _handle_desktop_action(self, action: str, now: float) -> None:
+        if action == "desktop":
+            self._toggle_desktop_annotation(now); return
+        controller = self.desktop_annotation
+        if controller is None or not controller.active:
+            return
+        if action == "exit": self._close_desktop_annotation()
+        elif action == "input": controller.toggle_input()
+        elif action == "laser": controller.toggle_laser()
+        elif action == "preview":
+            controller.preview_visible = not controller.preview_visible
+            controller.notify(f"CAMERA PREVIEW {'ON' if controller.preview_visible else 'OFF'}")
+        elif action == "calibrate": controller.start_calibration()
+        elif action == "save":
+            try: controller.save()
+            except Exception as exc: print(f"[DESKTOP] Save failed: {exc}", file=sys.stderr)
+        elif action == "toolbar": controller.toolbar.visible = not controller.toolbar.visible
+        elif action == "undo": controller.renderer.undo(); controller.notify("UNDO")
+        elif action == "redo": controller.renderer.redo(); controller.notify("REDO")
+        elif action == "clear": controller.request_clear()
+        elif action == "monitor": controller.cycle_monitor()
+        elif action == "camera": self._switch_camera(1, now)
+
+    def _close_desktop_annotation(self) -> None:
+        if self.desktop_annotation is not None:
+            self.desktop_annotation.close()
+            self.desktop_annotation = None
+        if self.desktop_hotkeys is not None:
+            self.desktop_hotkeys.unregister_active()
+        if self._desktop_window_hidden:
+            try:
+                cv2.moveWindow(WINDOW_NAME, 60, 60)
+                cv2.resizeWindow(WINDOW_NAME, UI_REFERENCE_WIDTH, UI_REFERENCE_HEIGHT)
+            except cv2.error:
+                pass
+            self._desktop_window_hidden = False
 
     def _active_view_state(self) -> CameraViewState:
         index = -1 if self.camera_manager.active_info is None else self.camera_manager.active_info.index

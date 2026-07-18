@@ -24,7 +24,7 @@ class AssistRect:
 
 
 class DrawingAssistUI:
-    actions = ("assist", "shape", "clean")
+    actions = ("assist", "shape", "clean", "desktop")
 
     def __init__(self) -> None:
         self.rects: dict[str, AssistRect] = {}
@@ -48,7 +48,7 @@ class DrawingAssistUI:
         self.accept_rect = AssistRect(0, 0, 0, 0)
         self.cancel_rect = AssistRect(0, 0, 0, 0)
         s, sf = layout.scaled, layout.scaled_font
-        labels = {"assist": f"ASSIST {assist[:3].upper()}", "shape": f"SHAPE {'ON' if auto_shape else 'OFF'}", "clean": f"CLEAN {cleanup[:3].upper()}"}
+        labels = {"assist": f"ASSIST {assist[:3].upper()}", "shape": f"SHAPE {'ON' if auto_shape else 'OFF'}", "clean": f"CLEAN {cleanup[:3].upper()}", "desktop": "DESKTOP"}
         for action, rect in self.rects.items():
             active = action == "assist" and assist != "off" or action == "shape" and auto_shape
             fill = (34, 70, 72) if active else (22, 38, 54)
