@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import sys
+import threading
 import time
 
 import cv2
@@ -44,9 +45,10 @@ class CameraInfo:
 class CameraManager:
     """Own exactly one active capture and never trust `isOpened()` alone."""
 
-    def __init__(self) -> None:
+    def __init__(self, shutdown_event: threading.Event | None = None) -> None:
         if hasattr(cv2, "setLogLevel"):
             cv2.setLogLevel(0)
+        self.shutdown_requested = shutdown_event or threading.Event()
         self.capture: cv2.VideoCapture | None = None
         self.active_info: CameraInfo | None = None
         self.available_cameras: list[CameraInfo] = []
@@ -66,6 +68,8 @@ class CameraManager:
         discovered: list[CameraInfo] = []
         detected: list[CameraInfo] = []
         for index in range(CAMERA_SCAN_START, CAMERA_SCAN_END + 1):
+            if self.shutdown_requested.is_set():
+                break
             if self.active_info is not None and self.capture is not None and index == self.active_info.index:
                 info = self.active_info
             else:
@@ -85,6 +89,8 @@ class CameraManager:
 
     def _probe(self, index: int) -> CameraInfo | None:
         for backend, name in self._backends():
+            if self.shutdown_requested.is_set():
+                return None
             capture, info, _ = self._open_validated(index, backend, name)
             if capture is not None:
                 capture.release()
@@ -92,6 +98,8 @@ class CameraManager:
         return None
 
     def open_camera(self, index: int) -> bool:
+        if self.shutdown_requested.is_set():
+            return False
         known = next((info for info in self.available_cameras if info.index == index), None)
         candidates = self._backends()
         if known:
@@ -99,6 +107,8 @@ class CameraManager:
         old_capture, old_info = self.capture, self.active_info
         print(f"[CAMERA] Switching active capture from {None if old_info is None else old_info.index} to {index}")
         for backend, name in candidates:
+            if self.shutdown_requested.is_set():
+                return False
             capture, info, frame = self._open_validated(index, backend, name)
             if capture is None or info is None or frame is None:
                 continue
@@ -117,6 +127,8 @@ class CameraManager:
         return False
 
     def open_preferred_camera(self, override_index: int | None = None) -> bool:
+        if self.shutdown_requested.is_set():
+            return False
         cameras = self.discover_cameras()
         if override_index is not None:
             return self.open_camera(override_index)
@@ -140,6 +152,8 @@ class CameraManager:
         return ordered[0] if ordered else None
 
     def switch_camera(self, direction: int = 1) -> bool:
+        if self.shutdown_requested.is_set():
+            return False
         cameras = self.discover_cameras()
         if not cameras:
             return False
@@ -153,6 +167,8 @@ class CameraManager:
         return False
 
     def read_frame(self) -> tuple[bool, np.ndarray | None]:
+        if self.shutdown_requested.is_set():
+            return False, None
         if self.capture is None:
             self.last_read_success = False
             self.consecutive_failures += 1
@@ -169,6 +185,8 @@ class CameraManager:
         return False, None
 
     def test_camera(self, index: int) -> tuple[CameraInfo | None, np.ndarray | None]:
+        if self.shutdown_requested.is_set():
+            return None, None
         if self.active_info is not None and index == self.active_info.index and self.last_frame is not None:
             return self.active_info, self.last_frame.copy()
         print(f"[CAMERA] Opening temporary test capture for index {index}")
@@ -187,6 +205,8 @@ class CameraManager:
         """Open one candidate at a time; caller owns a successful capture."""
         formats: tuple[tuple[int, int] | None, ...] = (None, (CAMERA_WIDTH, CAMERA_HEIGHT), (640, 480))
         for requested in formats:
+            if self.shutdown_requested.is_set():
+                break
             capture = cv2.VideoCapture(index, backend)
             keep_capture = False
             try:
@@ -197,6 +217,8 @@ class CameraManager:
                 frames: list[np.ndarray] = []
                 deadline = time.monotonic() + CAMERA_WARMUP_SECONDS
                 for _ in range(CAMERA_WARMUP_FRAME_LIMIT):
+                    if self.shutdown_requested.is_set():
+                        break
                     ok, frame = capture.read()
                     if ok and frame is not None and frame.size > 0 and frame.shape[0] >= 120 and frame.shape[1] >= 160:
                         frames.append(frame)
@@ -204,7 +226,7 @@ class CameraManager:
                             break
                     if time.monotonic() >= deadline:
                         break
-                if len(frames) >= CAMERA_VALID_FRAME_REQUIREMENT:
+                if not self.shutdown_requested.is_set() and len(frames) >= CAMERA_VALID_FRAME_REQUIREMENT:
                     metrics = self._frame_metrics(frames)
                     height, width = frames[-1].shape[:2]
                     fps = float(capture.get(cv2.CAP_PROP_FPS))
@@ -234,14 +256,20 @@ class CameraManager:
         }
 
     def recover_camera(self) -> bool:
+        if self.shutdown_requested.is_set():
+            return False
         failed_index = self.active_info.index if self.active_info else None
         if failed_index is not None:
             self.release()
             for attempt in range(CAMERA_RECONNECT_ATTEMPTS):
-                if attempt:
-                    time.sleep(CAMERA_RECONNECT_DELAY_SECONDS)
+                if self.shutdown_requested.is_set():
+                    return False
+                if attempt and self.shutdown_requested.wait(CAMERA_RECONNECT_DELAY_SECONDS):
+                    return False
                 if self.open_camera(failed_index):
                     return True
+        if self.shutdown_requested.is_set():
+            return False
         cameras = self.discover_cameras()
         fallbacks = sorted(cameras, key=lambda info: (info.index != DEFAULT_CAMERA_INDEX, info.pixels), reverse=False)
         return any(info.index != failed_index and self.open_camera(info.index) for info in fallbacks)

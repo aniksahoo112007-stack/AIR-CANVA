@@ -21,7 +21,7 @@ class AnnotationController:
         self.renderer=AnnotationRenderer(self.monitor.width,self.monitor.height); self.pointer=PointerRenderer(); self.toolbar=AnnotationToolbar()
         self.toolbar.visible=DESKTOP_TOOLBAR_VISIBLE_DEFAULT; self.preview_visible=DESKTOP_CAMERA_PREVIEW_DEFAULT
         self.tool=DESKTOP_DEFAULT_TOOL; self.color=DESKTOP_DEFAULT_COLOR; self.click_through=DESKTOP_OVERLAY_CLICK_THROUGH_DEFAULT; self.laser_mode=False
-        self.overlay:DesktopOverlay|None=None; self.active=False; self.message=''; self.message_until=0.0
+        self.overlay:DesktopOverlay|None=None; self.active=False; self.exit_requested=False; self.message=''; self.message_until=0.0
         self._drawing=False; self._toolbar_down=None; self._clear_armed_until=0.0
         self._calibration:list[tuple[float,float]]=[]; self._calibration_started=None; self._calibration_point=None
         self._paused=False;self._secondary_open_latched=False;self._secondary_wrist=[];self._secondary_action_at=0.0;self._both_open_started=None;self._both_open_latched=False
@@ -30,7 +30,7 @@ class AnnotationController:
     def enter(self)->None:
         if self.active:return
         try:
-            self.overlay=DesktopOverlay(self.monitor,self.click_through); self.active=True; self.notify('DESKTOP ANNOTATION ON')
+            self.exit_requested=False; self.overlay=DesktopOverlay(self.monitor,self.click_through); self.active=True; self.notify('DESKTOP ANNOTATION ON')
         except Exception:
             self.close(); raise
     def close(self)->None:
@@ -117,7 +117,7 @@ class AnnotationController:
         elif action=='redo':self.renderer.redo();self.notify('REDO')
         elif action=='clear':self.request_clear()
         elif action=='save':self.save()
-        elif action=='exit':self.notify('DESKTOP ANNOTATION OFF');self.active=False
+        elif action=='exit':self.notify('DESKTOP ANNOTATION OFF');self.exit_requested=True;self.active=False
 
     def request_clear(self)->None:
         now=time.monotonic()

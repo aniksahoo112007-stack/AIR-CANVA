@@ -7,6 +7,7 @@ import time
 import ctypes
 import argparse
 import os
+import threading
 
 # Suppress native Google telemetry chatter without hiding Python exceptions or
 # CameraManager diagnostics. These must be set before MediaPipe is imported.
@@ -58,7 +59,15 @@ class AirCanvasApp:
     """Coordinate capture, tracking, drawing, history, animation, and UI."""
 
     def __init__(self, camera_override: int | None = None) -> None:
-        self.camera_manager = CameraManager()
+        self.shutdown_requested = threading.Event()
+        self._shutdown_lock = threading.RLock()
+        self._shutdown_in_progress = False
+        self._shutdown_complete = False
+        self._shutdown_reason: str | None = None
+        self._window_created = False
+        self._window_presented = False
+        self._worker_threads: list[threading.Thread] = []
+        self.camera_manager = CameraManager(self.shutdown_requested)
         self.camera_selector = CameraSelector()
         self.camera_view_controls = CameraViewControls()
         self.drawing_assist_ui = DrawingAssistUI()
@@ -150,17 +159,96 @@ class AirCanvasApp:
         try:
             self._initialize()
             return self._event_loop()
+        except KeyboardInterrupt:
+            self.request_shutdown("keyboard interrupt")
+            raise
         except (HandTrackerError, RuntimeError, OSError) as exc:
+            self.request_shutdown(f"fatal error: {type(exc).__name__}")
             print(f"{APP_NAME}: {exc}", file=sys.stderr)
             return 1
+        except Exception as exc:
+            self.request_shutdown(f"fatal error: {type(exc).__name__}")
+            raise
         finally:
-            self._close_desktop_annotation()
+            self.shutdown()
+
+    def request_shutdown(self, reason: str) -> None:
+        """Request application-wide shutdown exactly once."""
+        with self._shutdown_lock:
+            if self.shutdown_requested.is_set():
+                return
+            self._shutdown_reason = reason
+            self.shutdown_requested.set()
+            print(f"[SHUTDOWN] Requested: {reason}")
+
+    def shutdown(self) -> None:
+        """Idempotently release all application resources."""
+        self.request_shutdown("application shutdown handler")
+        with self._shutdown_lock:
+            if self._shutdown_complete or self._shutdown_in_progress:
+                return
+            self._shutdown_in_progress = True
+
+        try:
+            # The event is already set, so no loop, recovery path, or UI
+            # callback can start new work while resources are being released.
+            self.current_hands.clear()
+            self._reset_toolbar_interaction(clear_cursor=True)
+            if self.canvas is not None:
+                try:
+                    self._end_stroke("application shutdown")
+                except Exception as exc:
+                    print(f"[SHUTDOWN] Could not end drawing stroke: {exc}", file=sys.stderr)
+            self._reject_pending_preview()
+
+            try:
+                self._close_desktop_annotation()
+            except Exception as exc:
+                print(f"[SHUTDOWN] Could not close desktop overlay: {exc}", file=sys.stderr)
+
             if self.desktop_hotkeys is not None:
-                self.desktop_hotkeys.close()
-            self.camera_manager.release()
+                try:
+                    self.desktop_hotkeys.close()
+                except Exception as exc:
+                    print(f"[SHUTDOWN] Could not unregister hotkeys: {exc}", file=sys.stderr)
+                finally:
+                    self.desktop_hotkeys = None
+
+            try:
+                self.camera_manager.release()
+            except Exception as exc:
+                print(f"[SHUTDOWN] Could not release camera: {exc}", file=sys.stderr)
+
             if self.tracker is not None:
-                self.tracker.close()
-            cv2.destroyAllWindows()
+                try:
+                    self.tracker.close()
+                except Exception as exc:
+                    print(f"[SHUTDOWN] Could not close hand tracker: {exc}", file=sys.stderr)
+                finally:
+                    self.tracker = None
+                    self.dual_tracker = None
+
+            try:
+                cv2.destroyAllWindows()
+            except cv2.error as exc:
+                print(f"[SHUTDOWN] Could not destroy OpenCV windows: {exc}", file=sys.stderr)
+            finally:
+                self._window_created = False
+                self._window_presented = False
+
+            current_thread = threading.current_thread()
+            for worker in tuple(self._worker_threads):
+                if worker is current_thread or not worker.is_alive():
+                    continue
+                worker.join(timeout=2.0)
+                if worker.is_alive():
+                    print(f"[SHUTDOWN] Worker did not stop: {worker.name}", file=sys.stderr)
+            self._worker_threads.clear()
+        finally:
+            with self._shutdown_lock:
+                self._shutdown_complete = True
+                self._shutdown_in_progress = False
+            print("[SHUTDOWN] Cleanup complete")
 
     def _initialize(self) -> None:
         self.tracker = HandTracker(MODEL_PATH)
@@ -177,6 +265,7 @@ class AirCanvasApp:
             self.camera_selector.show_no_feed()
         self._after_camera_change(time.monotonic())
         cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+        self._window_created = True
         cv2.resizeWindow(WINDOW_NAME, UI_REFERENCE_WIDTH, UI_REFERENCE_HEIGHT)
         cv2.setMouseCallback(WINDOW_NAME, self._on_mouse)
         self._apply_fullscreen()
@@ -196,7 +285,10 @@ class AirCanvasApp:
         fps = 0.0
         invalid_frames = 0
 
-        while True:
+        while not self.shutdown_requested.is_set():
+            if not self._main_window_is_visible():
+                self.request_shutdown("window closed")
+                break
             ok, camera_frame = self.camera_manager.read_frame()
             frame_live = bool(ok and camera_frame is not None and camera_frame.size > 0)
             if not ok or camera_frame is None or camera_frame.size == 0:
@@ -204,10 +296,10 @@ class AirCanvasApp:
                 if invalid_frames == CAMERA_READ_FAILURE_LIMIT:
                     self._end_stroke("camera disconnected")
                     self.animations.notify("CAMERA DISCONNECTED", time.monotonic(), 1.3, (40, 100, 255))
-                    if self.camera_manager.recover_camera():
+                    if not self.shutdown_requested.is_set() and self.camera_manager.recover_camera():
                         self._after_camera_change(time.monotonic())
                         invalid_frames = 0
-                    else:
+                    elif not self.shutdown_requested.is_set():
                         self.animations.notify("NO CAMERA AVAILABLE", time.monotonic(), 1.5, (40, 100, 255))
                 elif invalid_frames > CAMERA_READ_FAILURE_LIMIT * 2:
                     invalid_frames = CAMERA_READ_FAILURE_LIMIT
@@ -237,6 +329,8 @@ class AirCanvasApp:
             if self.desktop_hotkeys is not None:
                 for desktop_action in self.desktop_hotkeys.poll():
                     self._handle_desktop_action(desktop_action, now)
+            if self.shutdown_requested.is_set():
+                break
             if self.desktop_annotation is not None and self.desktop_annotation.active:
                 self.desktop_annotation.set_camera(-1 if self.camera_manager.active_info is None else self.camera_manager.active_info.index)
                 try:
@@ -250,8 +344,17 @@ class AirCanvasApp:
                 fps = instantaneous_fps if fps == 0.0 else fps * 0.88 + instantaneous_fps * 0.12
                 previous_frame_time = current
                 if self.desktop_annotation is not None and not self.desktop_annotation.active:
+                    if self.desktop_annotation.exit_requested:
+                        self.request_shutdown("desktop overlay exit")
+                        break
                     self._close_desktop_annotation()
-                cv2.waitKeyEx(1)
+                key = cv2.waitKeyEx(1)
+                if key in (ord("q"), ord("Q"), 27):
+                    self.request_shutdown("escape" if key == 27 else "keyboard quit")
+                    break
+                if not self._main_window_is_visible():
+                    self.request_shutdown("window closed")
+                    break
                 continue
             hand = next((item for item in hands if item.is_primary), None)
             gesture = Gesture.IDLE
@@ -371,8 +474,14 @@ class AirCanvasApp:
             if DEBUG_DUAL_HAND_TRACKING or DEBUG_DRAWING_SMOOTHING or DEBUG_GESTURES or DEBUG_DRAWING_PIPELINE or DEBUG_DRAW_ASSIST or DEBUG_SHAPE_RECOGNITION:
                 self._draw_runtime_debug(presented)
             self._expire_pending_preview(now)
+            if self.shutdown_requested.is_set():
+                break
             cv2.imshow(WINDOW_NAME, presented)
+            self._window_presented = True
             key = cv2.waitKeyEx(1)
+            if not self._main_window_is_visible():
+                self.request_shutdown("window closed")
+                break
             control, shift = self._keyboard_modifiers()
             if not self._handle_key(key, now, (width, height), control, shift):
                 break
@@ -698,6 +807,7 @@ class AirCanvasApp:
             self.animations.notify("PREVIEW CANCELLED", now, 0.9)
             return True
         if key in (ord("q"), ord("Q"), 27):
+            self.request_shutdown("escape" if key == 27 else "keyboard quit")
             return False
         if key in (ord("c"), ord("C")):
             self._action_now, self._action_point, self._action_size = now, None, size
@@ -815,6 +925,8 @@ class AirCanvasApp:
             self._use_camera(selected, now)
 
     def _on_mouse(self, event: int, x: int, y: int, flags: int, _userdata: object = None) -> None:
+        if self.shutdown_requested.is_set():
+            return
         assist_action = self.drawing_assist_ui.update_mouse(event, x, y)
         if assist_action is not None:
             now = time.monotonic()
@@ -864,6 +976,8 @@ class AirCanvasApp:
         self.camera_selector.update_mouse(event, x, y, flags)
 
     def _toggle_desktop_annotation(self, now: float) -> None:
+        if self.shutdown_requested.is_set():
+            return
         if self.desktop_annotation is not None and self.desktop_annotation.active:
             self._close_desktop_annotation()
             self.animations.notify("DESKTOP ANNOTATION OFF", now, 1.2)
@@ -885,12 +999,14 @@ class AirCanvasApp:
             print(f"[DESKTOP] Initialization failed: {exc}", file=sys.stderr)
 
     def _handle_desktop_action(self, action: str, now: float) -> None:
+        if self.shutdown_requested.is_set():
+            return
         if action == "desktop":
             self._toggle_desktop_annotation(now); return
         controller = self.desktop_annotation
         if controller is None or not controller.active:
             return
-        if action == "exit": self._close_desktop_annotation()
+        if action == "exit": self.request_shutdown("desktop overlay exit")
         elif action == "input": controller.toggle_input()
         elif action == "laser": controller.toggle_laser()
         elif action == "preview":
@@ -913,13 +1029,13 @@ class AirCanvasApp:
             self.desktop_annotation = None
         if self.desktop_hotkeys is not None:
             self.desktop_hotkeys.unregister_active()
-        if self._desktop_window_hidden:
+        if self._desktop_window_hidden and not self.shutdown_requested.is_set():
             try:
                 cv2.moveWindow(WINDOW_NAME, 60, 60)
                 cv2.resizeWindow(WINDOW_NAME, UI_REFERENCE_WIDTH, UI_REFERENCE_HEIGHT)
             except cv2.error:
                 pass
-            self._desktop_window_hidden = False
+        self._desktop_window_hidden = False
 
     def _active_view_state(self) -> CameraViewState:
         index = -1 if self.camera_manager.active_info is None else self.camera_manager.active_info.index
@@ -1123,6 +1239,19 @@ class AirCanvasApp:
             pass
         return self.layout.window_width, self.layout.window_height
 
+    def _main_window_is_visible(self) -> bool:
+        """Return False once the user closes the authoritative main window."""
+        if self.shutdown_requested.is_set():
+            return False
+        if not self._window_created:
+            return True
+        if not self._window_presented:
+            return True
+        try:
+            return cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) >= 1
+        except cv2.error:
+            return False
+
     def _mode_label(self, gesture: Gesture) -> str:
         if gesture is Gesture.DRAW and self.active_tool_id == "eraser":
             return "Eraser"
@@ -1204,7 +1333,14 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         finally:
             manager.release()
-    return AirCanvasApp(camera_override=args.camera).run()
+    app = AirCanvasApp(camera_override=args.camera)
+    try:
+        return app.run()
+    except KeyboardInterrupt:
+        app.request_shutdown("keyboard interrupt")
+        return 130
+    finally:
+        app.shutdown()
 
 
 if __name__ == "__main__":
